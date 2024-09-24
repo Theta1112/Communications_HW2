@@ -1,0 +1,359 @@
+---
+title: "Novel Zillow Modelling Methodology"
+author: 'Sean Koh'
+date: "`r Sys.Date()`"
+output: 
+  html_document:  
+    theme: flatly
+    number_sections: true
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+# Introduction:
+The geospatial data team have developed a new class of predictive model that has shown an approximate **7% improvement over currently implemented models**. The team believes that the model is compatible with our current processes and could translate to a **wider margin and more frequent sales**. In order to capitalize on this opportunities, the team is requesting a **budget increment of \$50,000 for the coming quarter** in order to convert the prototype into a Minimum Viable Product (MVP). 
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE, results='hide'}
+knitr::opts_chunk$set(echo = FALSE,
+                      message = FALSE,
+                      warning = FALSE,
+                      results = 'hide')
+library(groundhog)
+groundhog.day="2024-09-01"
+pkgs=c('tidyverse', 'sf', 'colorspace')
+groundhog.library(pkgs, groundhog.day)
+
+# library(tidyverse)
+# library(sf)
+# library(colorspace)
+```
+
+```{r hard-coded-variables}
+# Define ACS Variables to get from census API
+ACS_VARS <- c("B01001_001E", # ACS total Pop estimate
+              "B25002_001E", # Estimate of total housing units
+              "B25002_003E", # Number of vacant housing units
+              "B19013_001E", # Median HH Income ($)
+              "B02001_002E", # People describing themselves as "white alone"
+              "B06009_006E") # Total graduate or professional
+
+CRS_SYSTEM <- 'EPSG:6565'
+```
+
+```{r load_utility_functions}
+# From PPA Lab 2
+q5 <- function(variable) {as.factor(ntile(variable, 5))}
+
+# From PPA Lab 2
+qBr <- function(df, variable, rnd) {
+  if (missing(rnd)) {
+    as.character(quantile(round(df[[variable]],0),
+                          c(.02,.2,.4,.6,.8), na.rm=T))
+  } else if (rnd == FALSE | rnd == F) {
+    as.character(formatC(quantile(df[[variable]],
+                                  c(.01,.2,.4,.6,.8), na.rm=T),
+                         digits = 3))
+  }
+}
+```
+
+```{r load_data}
+raw <- 
+  st_read("studentData.geojson") %>%
+  st_transform(CRS_SYSTEM) # All calculations in feet
+
+# Seperate data of challenge set and dataset to develop model for
+data <- raw[raw$sale_price != 0,]
+challenge_set <- raw[raw$sale_price == 0,]
+
+# Cache tract data
+tracts <- st_read("tracts.geojson")
+```
+
+# Background: 
+Zillow's housing valuation algorithm is the heart of the company's value-adding process. We generate value by out-predicting the market through expertise and data-driven insights. Our signature "Zestimate" is the core product that keeps our customers coming back. Improving our Zestimate is key to customer loyalty, sales profit margins, and our major growth driver. [@zillow-zestimate]
+
+# The Current Valuation Process
+Our current algorithm studies the features of the house (e.g. Livable area, number of bedrooms, etc.) and the location (quantified by the U.S. Census Tract). All the variables are computed within our proprietary "Zestimate" equation.  
+
+However, we were recently made aware of large losses occurring in Philadelphia. To visualize the losses, we plotted our current model's prediction of prices in Philadelphia against the actual sales prices in 2022-2023.
+```{r lm}
+lm.1 <- lm(sale_price ~ ., 
+           data = data %>%
+             dplyr::select(sale_price,
+                           number_of_bathrooms,
+                           number_of_bedrooms,
+                           total_livable_area,
+                           census_tract,
+                           ) %>%
+             st_drop_geometry())
+
+data.predicted <- data %>%
+  mutate(predicted_price = predict.lm(lm.1, data)) %>%
+  filter(!is.na(predicted_price)) %>% # Drop NA values for cleanliness
+  mutate(price_diff = predicted_price - sale_price,
+         price_diff_percent = (price_diff) / sale_price)
+```
+
+```{r plot_sales_price}
+
+plot.1.data <- data.predicted %>%
+  mutate(price_diff_cat = 
+           case_when(
+    price_diff_percent < -0.5 ~ "Severely Undervalued",
+    price_diff_percent < -0.1 ~ "Undervalued",
+    price_diff_percent < 0.1 ~ "Accurately-Valued",
+    price_diff_percent < 0.5 ~ "Overvalued",
+    TRUE ~ "Severely Overvalued"
+  )
+)
+
+# Mapping data
+ggplot() +
+  geom_sf(data = tracts, fill = "grey") +
+  geom_sf(data = plot.1.data[1:5000,], 
+          aes(colour = price_diff_cat),
+          show.legend = "point", size = .75) +
+  scale_colour_manual(values = rev(diverging_hcl(5, "Blue-Red")),
+                      labels= c("Severely Undervalued",
+                                "Undervalued",
+                                "Accurately-Valued",
+                                "Overvalued",
+                                "Severely Overvalued"),
+                   name="Quintile Breaks") +
+  labs(title="Actual vs Predicted Sales Price, Philadelphia",
+       subtitle = "Philadelphia, PA 2022-2023",
+       caption = "Data Source: PPA Midterm\n Figure 1.")+
+  theme_void()
+```
+We noticed a large systemic overvaluation of homes in the Downtown area and an undervaluation of homes in North-East Philadelphia.  
+
+# New proposed approach
+
+However, we have developed a new method to update our existing predictions and correct for these spatial patterns. This new methodology applies a 3-step process to extract pricing information from location. 
+
+
+
+```{r honeycomb_grid}
+area_honeycomb_grid = st_make_grid(data, c(1500, 1500), what = "polygons", square = F)
+
+# To sf and add grid ID
+honeycomb_grid_sf = st_sf(area_honeycomb_grid) %>%
+  st_transform(crs = CRS_SYSTEM) %>% 
+  # add grid ID
+  mutate(grid_id = 1:length(lengths(area_honeycomb_grid)))
+
+# Get only those that intersect with Philadelphia
+honeycomb_grid_sf <- honeycomb_grid_sf[st_intersection(
+  tracts, honeycomb_grid_sf),]
+```
+
+```{r rasterize_support}
+# test_buffer <- st_buffer(honeycomb_grid_sf[1,], 1000)
+is_adjacent <- function(x, center = 49){
+  offset <- c(-72, -37, -36, 0, 35, 36, 72)
+  if (center %% 72 >= 36){
+      out <- (x == center) | 
+      (x == center-36) | 
+      (x == center-72) | 
+      (x == center+36) |
+      (x == center+72) |
+      (x == center-37) |
+      (x == center+35)
+  } else {
+      out <- (x == center) | 
+      (x == center+36) | 
+      (x == center+72) | 
+      (x == center-36) |
+      (x == center-72) |
+      (x == center+37) |
+      (x == center-35)
+  }
+  return(out)
+}
+
+# Inclusive of center cells
+get_adj_mask <- function(center){
+  offset <- c(-72, -37, -36, 0, 35, 36, 72)
+  if (center %% 72 < 36) {
+    offset <- -offset
+  } 
+  return(center + offset)
+}
+```
+
+```{r rasterize}
+
+rasterize_sale_price <- function(honeycomb_grid){
+  mean_value <- numeric()
+  for (i in rownames(honeycomb_grid)){
+    if (length(mean_value) %% 10 == 0){
+      print(paste("Iteration:", length(mean_value)))
+    }
+    honeycomb <- honeycomb_grid[i,]
+    
+    in_points <- data[st_intersects(data, honeycomb)
+                      %>% lengths > 0,]
+    
+    mean_value <- c(mean_value, 
+                    mean(in_points$sale_price, na.rm = T))
+  }
+  honeycomb_grid$mean_value <- mean_value
+  return(honeycomb_grid)
+}
+
+# COMMENTED OUT AS IT TAKES A LONG WHILE TO RUN
+# honeycomb_grid_sf <- rasterize_sale_price(honeycomb_grid_sf)
+
+# CACHED HONEYCOMB GRID RASTERIZED DATA
+# st_write(honeycomb_grid_sf, "honeycomb_grid_rasterized.geojson")
+honeycomb_grid_sf <- st_read("honeycomb_grid_rasterized.geojson")
+row.names(honeycomb_grid_sf) <- as.numeric(honeycomb_grid_sf$grid_id)
+```
+
+
+Firstly, we map the location data of historical sales onto a honeycomb grid. This will let our algorithm read the sales data like an image, allowing us to seperate the map into distinct "zones" that share similar neighbourhood characteristics. 
+
+```{r convolutions}
+
+convolve_honeycomb <- function(honeycomb_data, col){
+  out <- numeric()
+  for (i in rownames(honeycomb_data)){
+    mask <- as.character(get_adj_mask(as.numeric(i)))
+  
+    mask_polygons <- honeycomb_data[mask,]
+    
+    out <- c(out, mean(mask_polygons[[col]], na.rm = T))
+  
+  }
+  return(out)
+}
+
+honeycomb_grid_sf$convolve_1 <- convolve_honeycomb(honeycomb_grid_sf, "mean_value")
+
+honeycomb_grid_sf$convolve_2 <- convolve_honeycomb(honeycomb_grid_sf, "convolve_1")
+
+honeycomb_grid_sf$convolve_3 <- convolve_honeycomb(honeycomb_grid_sf, "convolve_2")
+
+honeycomb_grid_sf$convolve_4 <- convolve_honeycomb(honeycomb_grid_sf, "convolve_3")
+
+honeycomb_grid_sf$convolve_5 <- convolve_honeycomb(honeycomb_grid_sf, "convolve_4")
+```
+
+```{r plot_2}
+
+plot.2.data <- rbind(
+    honeycomb_grid_sf %>%
+    select(convolve_5) %>%
+    rename("Mean_Price" = convolve_5) %>%
+    mutate(label = "Smoothed Data"),
+  honeycomb_grid_sf %>%
+    select(mean_value) %>%
+    rename("Mean_Price" = mean_value) %>%
+    mutate(label = "Raw Data")
+)
+
+ggplot() +
+  geom_sf(data = plot.2.data, 
+          aes(fill = q5(Mean_Price))) + 
+  scale_fill_manual(values = rev(sequential_hcl(5, "Red-Blue")),
+                   labels=qBr(plot.2.data,"Mean_Price"),
+                   name="Home Value ($)\n(Quintile Breaks)") + 
+  labs(title = "Before and After Convolution Smoothing ",
+       subtitle = "Rasterized home value",
+       caption = "Data Source: PPA Midterm\n Figure 2.") + 
+  facet_wrap(~label) + 
+  theme_void()
+```
+
+Secondly, we smooth out the grid through a process known as convolution. Broadly, this will help to get rid of "noise" in a manner similar to clarifying a blurry picture.
+
+Finally, we divide the city area into zones based on the price values from the smoothed out grid. Ideally, these zones will convey important price signals about how the location of the home determines the valuation. A significant improvement of this new model over the current one is that we are not bound by the shape of census tracts.
+
+```{r generate_zones}
+
+honeycomb_grid_sf$zone <- q5(honeycomb_grid_sf$convolve_5)
+as.numeric(honeycomb_grid_sf[1,]$zone)
+
+data.predicted$zone <- -1
+
+derasterize_sale_price <- function(data, honeycomb_grid){
+  for (i in rownames(honeycomb_grid)){
+    honeycomb <- honeycomb_grid[i,]
+    
+    data[st_intersects(data, honeycomb)
+                      %>% lengths > 0,"zone"] <- as.numeric(honeycomb$zone)
+  }
+  return(data)
+}
+
+# Cached due to long execution time
+#data.predicted.2 <- derasterize_sale_price(data.predicted, honeycomb_grid_sf)
+#st_write(data.predicted.2, "data-predicted-2.geojson")
+data.predicted.2 <- st_read("data-predicted-2.geojson")
+```
+
+```{r lm.2}
+lm.2 <- lm(sale_price ~ ., 
+           data = data.predicted.2 %>%
+             dplyr::select(sale_price,
+                           number_of_bathrooms,
+                           number_of_bedrooms,
+                           zone
+                           ) %>%
+             st_drop_geometry())
+
+data.predicted.2 <- data.predicted.2 %>%
+  mutate(predicted_price = predict.lm(lm.2, data.predicted.2)) %>%
+  mutate(price_diff = predicted_price - sale_price,
+         price_diff_percent = (price_diff) / sale_price)
+```
+
+```{r plot.3}
+plot.3.data <- data.predicted.2 %>%
+  mutate(price_diff_cat = 
+           case_when(
+    price_diff_percent < -0.5 ~ "Severely Undervalued",
+    price_diff_percent < -0.1 ~ "Undervalued",
+    price_diff_percent < 0.1 ~ "Accurately-Valued",
+    price_diff_percent < 0.5 ~ "Overvalued",
+    TRUE ~ "Severely Overvalued"
+  )
+)
+
+# Mapping data
+ggplot() +
+  geom_sf(data = tracts, fill = "grey") +
+  geom_sf(data = plot.3.data[1:5000,], 
+          aes(colour = price_diff_cat),
+          show.legend = "point", size = .75) +
+  scale_colour_manual(values = rev(diverging_hcl(5, "Blue-Red")),
+                      labels= c("Severely Undervalued",
+                                "Undervalued",
+                                "Accurately-Valued",
+                                "Overvalued",
+                                "Severely Overvalued"),
+                   name="Quintile Breaks") +
+  labs(title="Actual vs Predicted Sales Price, Philadelphia",
+       subtitle = "Philadelphia, PA 2022-2023",
+       caption = "Data Source: PPA Midterm\n Figure 3.")+
+  theme_void()
+
+mape_old <- round(100 * mean(abs(data.predicted$price_diff_percent)),1)
+mape_new <- round(100 * mean(abs(data.predicted.2$price_diff_percent)),1)
+```
+
+# Conclusion
+
+The new proposed model improves the Mean Abosolute Percentage Error (MAPE) from `r toString(mape_old)` to `r toString(mape_new)`. We also can observe a large reduction in overvaluations in the downtown area, with a minor increase in overvaluations in North Philadelphia.
+
+Overall, the new model still requires tuning and improvements before it can be implemented in production. Key areas to study are how the model affects different home types, where its biases lie, and how we can continue to improve upon it.
+
+# References
+
+In order to continue research on this model, we are thus requesting an expanded budget in order to bring in new team members to iterate on the current model. 
